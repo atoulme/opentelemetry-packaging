@@ -356,7 +356,7 @@ See [Independent packages](#independent-packages) for why it has no relationship
 |------|-------------|
 | `/usr/lib/opentelemetry-jmx-scraper/opentelemetry-jmx-scraper.jar` | JMX scraper JAR |
 | `/etc/opentelemetry/jmx-scraper/config.properties` | Scraper configuration (JMX endpoint, OTLP exporter settings, metric definitions) |
-| `/etc/opentelemetry/jmx-scraper/jmx-scraper.env` | Environment overrides read by the systemd unit before it starts the JVM (`JAVA_HOME`, `JMX_SCRAPER_CONFIG`) |
+| `/etc/opentelemetry/jmx-scraper/jmx-scraper.env` | Environment overrides read by the systemd unit before it starts the JVM (`PATH`, `JMX_SCRAPER_CONFIG`) |
 | `/usr/lib/systemd/system/opentelemetry-jmx-scraper.service` | systemd unit that runs the scraper |
 | `/usr/share/man/man8/opentelemetry-jmx-scraper.8.gz` | Man page |
 | `/usr/share/doc/opentelemetry-jmx-scraper/` | Documentation and copyright |
@@ -371,32 +371,41 @@ See [Independent packages](#independent-packages) for why it has no relationship
 | Post-install | `systemctl daemon-reload` (unit not enabled by default) | Same |
 | Pre-uninstall | `systemctl disable --now opentelemetry-jmx-scraper.service` if active | Same |
 
-#### Overriding `JAVA_HOME` and the config file path
+#### Overriding the Java binary and the config file path
 
-The systemd unit does not hardcode `java -jar …` or a `-config` path directly.
-Instead, it declares:
+`/usr/lib/jvm/default-java` is specific to Debian-based systems, so the unit must not use it as a default `JAVA_HOME` on RPM-based systems.
+The systemd unit finds `java` on `PATH` and supplies a default config path:
 
 ```ini
+Environment=JMX_SCRAPER_CONFIG=/etc/opentelemetry/jmx-scraper/config.properties
 EnvironmentFile=-/etc/opentelemetry/jmx-scraper/jmx-scraper.env
-ExecStart=${JAVA_HOME}/bin/java -jar /usr/lib/opentelemetry-jmx-scraper/opentelemetry-jmx-scraper.jar -config ${JMX_SCRAPER_CONFIG}
+ExecStart=/usr/bin/env java -jar /usr/lib/opentelemetry-jmx-scraper/opentelemetry-jmx-scraper.jar -config ${JMX_SCRAPER_CONFIG}
 ```
 
-`jmx-scraper.env` ships with both variables set to their defaults:
+`/usr/bin/env` resolves `java` using the unit's `PATH`, including any distribution-managed Java alternative.
+The [systemd environment file](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#EnvironmentFile=) overrides the unit's `Environment=` default when it sets the same variable.
+
+`jmx-scraper.env` ships with the config path set to its default:
 
 ```sh
-JAVA_HOME=/usr/lib/jvm/default-java
 JMX_SCRAPER_CONFIG=/etc/opentelemetry/jmx-scraper/config.properties
 ```
 
-The leading `-` in `EnvironmentFile=-…` tells systemd to keep starting the unit even if the file is missing (matching the "config file, safe to edit or remove" contract used elsewhere in this project).
-A user who has a JVM installed at a non-standard path, or who wants a scraper config outside `/etc/opentelemetry/`, edits `jmx-scraper.env` and runs `systemctl restart opentelemetry-jmx-scraper.service`; no package rebuild or unit-file edit is needed.
-Because `jmx-scraper.env` is a `config|noreplace` file like `config.properties`, package upgrades never clobber a user's overrides.
+The leading `-` makes the environment file optional; the unit still uses its default config path if that file is removed.
+To use a config file elsewhere, a user edits `jmx-scraper.env` and restarts the service.
+To select a different JVM, a user sets `PATH=/opt/myjdk/bin:/usr/bin:/bin` in that file before restarting the service.
+Both config files have nfpm type `config|noreplace`, so package upgrades preserve these overrides.
 
 The Java runtime is a soft dependency: a suitable JRE/JDK can already be present on the host through a distribution package, a version manager (e.g., SDKMAN!), or a manually installed JDK, and a hard `Depends` would conflict with whichever one is already providing `java`.
 `apt`/`dnf` still surface the suggestion so users without a JVM know what to install, but package installation and removal never blocks on it.
 
-The scraper is disabled by default after install; a user who wants it running must edit `config.properties` and run `systemctl enable --now opentelemetry-jmx-scraper.service`.
-This mirrors the JMX scraper's nature as an opt-in monitoring tool for a specific JVM target, rather than a suite component installed for every host.
+The package installs the unit without starting or enabling it, and `config.properties` ships without a JMX target.
+The user must set the endpoint, port, and credentials if required, then run `systemctl enable --now opentelemetry-jmx-scraper.service`.
+Until then, the host does not claim to be scraping a JVM just because the package is installed.
+
+Automatic discovery of local JVMs started with `-Dcom.sun.management.jmxremote` cannot identify remote targets or determine their credentials.
+An interactive installation prompt also cannot configure unattended installs, and would introduce a second configuration path alongside `config.properties`.
+These options can be considered separately; this package requires an explicit target and service activation.
 
 ## Independent packages
 
@@ -405,6 +414,10 @@ It has:
 
 - **No `Provides` virtual package.** It is not a swappable alternative — there is no injector-mediated contract for it to implement, so there is no interface generation to version.
 - **No relationship to `opentelemetry-injector`.** The injector activates in-process language agents via `/etc/ld.so.preload`; the JMX scraper is an out-of-process metrics collector that polls a JMX endpoint over the network or a local socket. The two mechanisms do not interact.
+- **No relationship to `opentelemetry-java-autoinstrumentation`.**
+  The Java agent observes a JVM from inside, so installing the scraper is not required to monitor a JVM that already uses the agent.
+  The scraper collects metrics through JMX from a local or remote JVM without requiring an agent in that JVM.
+  Both may be useful on the same host when the desired JMX metrics are not available from the agent; neither package requires the other.
 - **No entry in the `opentelemetry` metapackage's `Recommends`.** Installing `opentelemetry` (or any language package) never pulls in the JMX scraper, and installing the JMX scraper never pulls in the injector or any language package.
 - **Its own install prefix, but a config path under the shared config tree.** The JAR and systemd unit live under `/usr/lib/opentelemetry-jmx-scraper/`, not a subdirectory of `/usr/lib/opentelemetry/`, since it is not one of the injector-activated agents.
   Its configuration file lives at `/etc/opentelemetry/jmx-scraper/config.properties`, alongside the other components' config directories, purely because `/etc/opentelemetry/` is the recognizable, documented location for this project's configuration — not because the scraper participates in the injector's `conf.d/` mechanism or any vendor-override contract.
